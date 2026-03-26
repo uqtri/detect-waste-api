@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import uuid
@@ -26,6 +27,7 @@ DEVICE = os.getenv("PREDICTION_DEVICE", "cpu")
 PROB_THRESHOLD = float(os.getenv("PREDICTION_PROB_THRESHOLD", "0.17"))
 CLS_THRESHOLD = float(os.getenv("PREDICTION_CLS_THRESHOLD", "0.5"))
 CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "detect-waste")
+MAX_PARALLEL_IMAGES = max(1, int(os.getenv("MAX_PARALLEL_IMAGES", "4")))
 
 
 app = FastAPI(title="Detect Waste API", version="1.0.0")
@@ -142,6 +144,33 @@ def _upload_prediction_to_cloudinary(image_path: str, public_id: str) -> str:
     return result["secure_url"]
 
 
+def _process_one_image(image_url: str) -> dict:
+    parsed = urlparse(image_url)
+    suffix = Path(parsed.path).suffix or ".jpg"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_image_path = os.path.join(temp_dir, f"input{suffix}")
+        output_image_path = os.path.join(temp_dir, "prediction.png")
+
+        _download_image_from_url(image_url, input_image_path)
+        detections = run_prediction(input_image_path, output_image_path)
+        predicted_url = _upload_prediction_to_cloudinary(
+            output_image_path,
+            public_id=f"prediction-{uuid.uuid4().hex}",
+        )
+
+    return {
+        "source_url": image_url,
+        "detections": detections,
+        "predicted_url": predicted_url,
+    }
+
+
+async def _process_one_image_async(image_url: str, semaphore: asyncio.Semaphore) -> dict:
+    async with semaphore:
+        return await asyncio.to_thread(_process_one_image, image_url)
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
@@ -155,29 +184,22 @@ async def predict_images(payload: PredictRequest):
     try:
         _configure_cloudinary()
 
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_IMAGES)
+        tasks = [
+            _process_one_image_async(image_url, semaphore)
+            for image_url in payload.image_urls
+        ]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
         results = []
-        for image_url in payload.image_urls:
-            parsed = urlparse(image_url)
-            suffix = Path(parsed.path).suffix or ".jpg"
-
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_image_path = os.path.join(temp_dir, f"input{suffix}")
-                output_image_path = os.path.join(temp_dir, "prediction.png")
-
-                _download_image_from_url(image_url, input_image_path)
-                detections = run_prediction(input_image_path, output_image_path)
-                predicted_url = _upload_prediction_to_cloudinary(
-                    output_image_path,
-                    public_id=f"prediction-{uuid.uuid4().hex}",
-                )
-
-                results.append(
-                    {
-                        "source_url": image_url,
-                        "detections": detections,
-                        "predicted_url": predicted_url,
-                    }
-                )
+        for image_url, item in zip(payload.image_urls, task_results):
+            if isinstance(item, Exception):
+                results.append({
+                    "source_url": image_url,
+                    "error": str(item),
+                })
+            else:
+                results.append(item)
 
         return {"results": results}
     except RuntimeError as exc:
