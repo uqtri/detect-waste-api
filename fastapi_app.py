@@ -101,13 +101,15 @@ def run_prediction(input_image_path: str, output_image_path: str) -> dict:
         pred = probs.argmax().item()
         conf = probs[pred].item()
 
+        # `p` is a view into model output; do not modify in-place.
         # plot_results expects class id to be 1-based.
-        p[1] = pred + 1
-        p[0] = conf
+        p_out = p.detach().clone()
+        p_out[1] = pred + 1
+        p_out[0] = conf
 
         if conf >= CLS_THRESHOLD:
             bboxes_final.append((xmin, ymin, xmax, ymax))
-            cls_prob.append(p)
+            cls_prob.append(p_out)
             kept_boxes.append(
                 {
                     "label": predictor.classes[pred]
