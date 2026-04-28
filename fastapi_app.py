@@ -69,7 +69,7 @@ def get_detector():
     return detector
 
 
-def run_prediction(input_image_path: str, output_image_path: str) -> int:
+def run_prediction(input_image_path: str, output_image_path: str) -> dict:
     detector = get_detector()
     image = predictor.Image.open(input_image_path).convert("RGB")
 
@@ -79,7 +79,7 @@ def run_prediction(input_image_path: str, output_image_path: str) -> int:
     bboxes_keep = outputs[0, outputs[0, :, 4] > PROB_THRESHOLD]
     if bboxes_keep.numel() == 0:
         predictor.plot_results(image, [], [], predictor.classes, output_image_path)
-        return 0
+        return {"count": 0, "boxes": []}
 
     probas = bboxes_keep[:, 4:]
     bboxes_scaled = predictor.rescale_bboxes(
@@ -88,6 +88,7 @@ def run_prediction(input_image_path: str, output_image_path: str) -> int:
 
     bboxes_final = []
     cls_prob = []
+    kept_boxes = []
 
     for p, (xmin, ymin, xmax, ymax) in zip(probas, bboxes_scaled.tolist()):
         crop = image.crop((xmin, ymin, xmax, ymax))
@@ -107,6 +108,21 @@ def run_prediction(input_image_path: str, output_image_path: str) -> int:
         if conf >= CLS_THRESHOLD:
             bboxes_final.append((xmin, ymin, xmax, ymax))
             cls_prob.append(p)
+            kept_boxes.append(
+                {
+                    "label": predictor.classes[pred]
+                    if 0 <= pred < len(predictor.classes)
+                    else str(pred),
+                    "class_id": pred,
+                    "confidence": conf,
+                    "bbox": {
+                        "xmin": xmin,
+                        "ymin": ymin,
+                        "xmax": xmax,
+                        "ymax": ymax,
+                    },
+                }
+            )
 
     predictor.plot_results(
         image,
@@ -115,7 +131,7 @@ def run_prediction(input_image_path: str, output_image_path: str) -> int:
         predictor.classes,
         output_image_path,
     )
-    return len(bboxes_final)
+    return {"count": len(bboxes_final), "boxes": kept_boxes}
 
 
 def _download_image_from_url(image_url: str, dst_path: str) -> None:
@@ -153,7 +169,7 @@ def _process_one_image(image_url: str) -> dict:
         output_image_path = os.path.join(temp_dir, "prediction.png")
 
         _download_image_from_url(image_url, input_image_path)
-        detections = run_prediction(input_image_path, output_image_path)
+        prediction = run_prediction(input_image_path, output_image_path)
         predicted_url = _upload_prediction_to_cloudinary(
             output_image_path,
             public_id=f"prediction-{uuid.uuid4().hex}",
@@ -161,8 +177,9 @@ def _process_one_image(image_url: str) -> dict:
 
     return {
         "source_url": image_url,
-        "detections": detections,
+        "detections": prediction["count"],
         "predicted_url": predicted_url,
+        "boxes": prediction["boxes"],
     }
 
 
@@ -201,7 +218,16 @@ async def predict_images(payload: PredictRequest):
             else:
                 results.append(item)
 
-        return {"results": results}
+        urls = [
+            item.get("predicted_url")
+            for item in results
+            if isinstance(item, dict) and item.get("predicted_url")
+        ]
+
+        # Backward/forward compatible payload:
+        # - `urls`: convenience list of generated prediction image URLs
+        # - `results`: per-image objects (source_url, predicted_url, detections, error, ...)
+        return {"urls": urls, "results": results}
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
